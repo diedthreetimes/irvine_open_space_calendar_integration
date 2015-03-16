@@ -3,10 +3,14 @@
 #require 'sqlite3'
 require 'google/api_client'
 require 'google/api_client/auth/file_storage'
+require 'google/api_client/auth/installed_app'
 require 'net/http'
 require 'uri'
 require 'nokogiri'
+require 'yaml'
+require 'time'
 require 'pry'
+
 
 # General TODOs
 # 1. Keep track of already seen events in a sqlite db and query them again.
@@ -15,16 +19,16 @@ require 'pry'
 BASE_DIR = File.dirname(__FILE__)
 
 # Google API Params
-# TODO make sure the following to files start form current directory
 SECRET_FILE = "#{BASE_DIR}/secrets/google_api.yaml"
-CREDENTIAL_STORAGE_FILE = "#{BASE_DIR}/secrets/oauth2.json"
+CREDENTIAL_STORE_FILE = "#{BASE_DIR}/secrets/oauth2.json"
 AUTH_SCOPE = ['https://www.googleapis.com/auth/calendar']
+SAVED_CALENDAR = "#{BASE_DIR}/secrets/saved_calendar.yaml"
 
 
 # Scrape params
 BASE_URL = "http://letsgooutside.org/activities/?action=search_events&pno="
-SCRAPE_LIMIT = 1 # TODO: Parse the nav at the bottom and crawl all pages
-DEBUG_PARSE = true
+SCRAPE_LIMIT = 1
+DEBUG_PARSE = false
 TEST_PAGE = "#{BASE_DIR}/sample/access_example.html"
 
 class Event
@@ -34,7 +38,7 @@ class Event
   attr_accessor :title
   attr_accessor :location
   attr_accessor :more_details
-  attr_accessor :all_day_event
+  attr_accessor :all_day
 
   def parse_start_stop date_str, time_str
     return self if date_str.nil?
@@ -43,7 +47,7 @@ class Event
     date = Date.strptime(date_str, "%m/%d/%Y")
 
     if time_str.nil?
-      all_day_event = true
+      all_day = true
 
       self.start_time = date.to_time
       self.stop_time = date.to_time
@@ -72,21 +76,59 @@ class Event
     puts "E: #{stop_time}"
     puts "--------------------"
   end
+
+  def to_hash
+    start_hash = if all_day then
+      {'date' => start_time.rfc3339} # formatted as yyyy-mm-dd
+    else
+      {'dateTime' => start_time.rfc3339} # formatted as # RFC 3339 wtih a timezone offset (or 'timezone' field)
+    end
+
+    stop_hash = if all_day then
+      {'date' => stop_time.rfc3339} # formatted as yyyy-mm-dd
+    else
+      {'dateTime' => stop_time.rfc3339} # formatted as # RFC 3339 wtih a timezone offset (or 'timezone' field)
+    end
+
+
+    {
+      'summary' => title,
+      'description' => description,
+      'location' => location,
+      'start' => start_hash,
+      'end' => stop_hash,
+      'source' => {
+        'title' => title,
+        'url' => more_details
+      }
+    }
+  end
+
+  def to_json
+    JSON.dump(to_hash)
+  end
 end
 
+class Time
+  def rfc3339 i = nil
+    to_datetime.rfc3339(i)
+  end
+end
+
+def say msg
+  puts msg
+end
 
 def google_tokens
   $tokens ||= YAML.load_file(SECRET_FILE)
 end
 
 def client
-  $client ||= Google::APIClient::InstalledAppFlow.new(
-                       :client_id => google_tokens[:oauth][:client_id],
-                       :client_secret => google_tokens[:oauth][:client_secret],
-                       :scope => [AUTH_SCOPE]
-                                                    )
+  $client ||= Google::APIClient.new(
+     :application_name => "IrvineOpenSpaceImporter",
+     :application_version => "1.0.0")
 
-  authorize if $client.authorization.access_token.nil?
+  authorize if ($client.authorization.nil? || $client.authorization.access_token.nil?)
 
   $client
 end
@@ -94,31 +136,92 @@ end
 def authorize
   file_storage = Google::APIClient::FileStorage.new(CREDENTIAL_STORE_FILE)
   if file_storage.authorization.nil?
-    client.authorization = flow.authorize(file_storage)
+    flow = Google::APIClient::InstalledAppFlow.new(
+                       :client_id => google_tokens["oauth"]["client_id"],
+                       :client_secret => google_tokens["oauth"]["client_secret"],
+                       :scope => [AUTH_SCOPE])
+
+    $client.authorization = flow.authorize(file_storage)
   else
-    client.authorization = file_storage.authorization
+    $client.authorization = file_storage.authorization
   end
 end
 
 def calendar
-  $calapi= client.discovered_api('TODO')
+  $calapi= client.discovered_api('calendar', 'v3')
 end
 
-def make_calendar
+def calendar_exists? id
+  result = client.execute(:api_method => calendar.calendars.get,
+                          :parameters => {'calendarId' => id})
 
+  if !result.data?
+    false
+  elsif result.data && result.data["error"]
+    if result.data["error"]["errors"].first["reason"] == "notFound"
+      false
+    else
+      abort("Calendar could not be verified " + result.data["error"]["errors"].first["reason"].to_s)
+    end
+  else
+    true
+  end
 end
 
-def make_event event
-  return if event_present?( event )
+def make_calendar summary = 'Open Space Preserve'
+  result = client.execute(:api_method => calendar.calendars.insert,
+                          :body => {'summary' => summary}.to_json,
+                          :headers => {'Content-Type' => 'application/json'})
 
-  puts event.to_s
+  return nil if !result.data?
+
+  # TODO: Why does the summary not get send with the boyd?
+  if !result.data["error"].nil?
+    abort result.data["error"]["message"]
+  end
+
+  id = result.data["id"]
+  File.open( SAVED_CALENDAR, 'w' ) {|file|
+    file.write(id)
+  }
+
+  id
 end
 
-def event_present? event
-  false
+def make_event event, calendar_id
+  if event_present?( event, calendar_id )
+    say "#{event.title} already on the calendar"
+    return # TODO: Eventually silence this statmenet
+  end
+
+  result = client.execute(:api_method => calendar.events.insert,
+                          :parameters => { 'calendarId' => calendar_id},
+                          :body => event.to_json,
+                          :headers => {'Content-Type' => 'application/json'})
+  if !result.data?
+    warn "#{event.title} could not be saved"
+  end
+
+  # TODO: Save the resulting event id (result.data.id)
 end
 
-def parse_page html
+def event_present? event, calendar_id
+  result = client.execute(:api_method => calendar.events.list,
+                          # These times need to be datetimes, the library may not handle times correctly
+                          :parameters => {'timeMin' => event.start_time.rfc3339, 'timeMax' => event.stop_time.rfc3339,
+                            'q' => event.title, 'singleEvents' => "true", 'calendarId' => calendar_id})
+
+  if !result.data?
+    false
+  elsif result.data["error"]
+    # TODO: raise instead
+    abort result.data["error"]["message"]
+  end
+
+  !result.data["items"].empty?
+end
+
+def parse_page html, calendar_id
   page = Nokogiri::HTML(html)
 
   page.css(".event-listing").each do |event_e|
@@ -142,25 +245,40 @@ def parse_page html
 
     event.parse_start_stop( date, time )
 
-    make_event event
+    make_event( event, calendar_id )
   end
 end
 
-def scrape_all
+def scrape_all calendar_id
   if DEBUG_PARSE
-    parse_page File.open(TEST_PAGE)
+    parse_page( File.open(TEST_PAGE), calendar_id )
     return
   end
-  SCRAPE_LIMIT.times do |i|
-    uri = URI.parse(BASE_URL + i)
 
-    parse_page( Net::HTTP.get_response(uri).body )
+  # TODO: Parse the nav at the bottom and crawl all pages
+  SCRAPE_LIMIT.times do |i|
+    uri = URI.parse(BASE_URL + i.to_s)
+
+    parse_page( Net::HTTP.get_response(uri).body, calendar_id )
   end
 end
 
 
 if __FILE__ == $0
-  make_calendar
+  id = nil
+  if !File.exists?( SAVED_CALENDAR )
+    say "No saved calendar, creating a new one"
+    id = make_calendar
+  else
+    id = File.open( SAVED_CALENDAR ).readline.strip
+    unless calendar_exists? id
+      say "Calendar for #{id} not found, making a new one"
+      id = make_calendar
+    end
+  end
 
-  scrape_all
+  if id.nil?
+    abort "No calendar could be found/created"
+  end
+  scrape_all id
 end
