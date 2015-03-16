@@ -80,7 +80,8 @@ class Event
 
   def query_title
     # Remove special characters
-    title.gsub("-"," ")
+    title.gsub!("-"," ")
+    title.gsub!(":"," ")
   end
 
   def to_hash
