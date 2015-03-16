@@ -23,11 +23,12 @@ SECRET_FILE = "#{BASE_DIR}/secrets/google_api.yaml"
 CREDENTIAL_STORE_FILE = "#{BASE_DIR}/secrets/oauth2.json"
 AUTH_SCOPE = ['https://www.googleapis.com/auth/calendar']
 SAVED_CALENDAR = "#{BASE_DIR}/secrets/saved_calendar.yaml"
-
+HIGHLIGHT_COLOR = "7"
+HIGHLIGHT_FILTER = /Wilderness Access/
 
 # Scrape params
 BASE_URL = "http://letsgooutside.org/activities/?action=search_events&pno="
-SCRAPE_LIMIT = 1
+SCRAPE_LIMIT = 10
 DEBUG_PARSE = false
 TEST_PAGE = "#{BASE_DIR}/sample/access_example.html"
 
@@ -77,6 +78,11 @@ class Event
     puts "--------------------"
   end
 
+  def query_title
+    # Remove special characters
+    title.gsub("-"," ")
+  end
+
   def to_hash
     start_hash = if all_day then
       {'date' => start_time.rfc3339} # formatted as yyyy-mm-dd
@@ -104,8 +110,13 @@ class Event
     }
   end
 
-  def to_json
-    JSON.dump(to_hash)
+  def to_json color = nil
+    hash = to_hash
+    if color
+      hash["colorId"] = color
+    end
+
+    JSON.dump(hash)
   end
 end
 
@@ -194,9 +205,16 @@ def make_event event, calendar_id
     return # TODO: Eventually silence this statmenet
   end
 
+
+  color = if event.title =~ HIGHLIGHT_FILTER
+            HIGHLIGHT_COLOR
+          else
+            nil
+          end
+
   result = client.execute(:api_method => calendar.events.insert,
                           :parameters => { 'calendarId' => calendar_id},
-                          :body => event.to_json,
+                          :body => event.to_json(color),
                           :headers => {'Content-Type' => 'application/json'})
   if !result.data?
     warn "#{event.title} could not be saved"
@@ -209,7 +227,7 @@ def event_present? event, calendar_id
   result = client.execute(:api_method => calendar.events.list,
                           # These times need to be datetimes, the library may not handle times correctly
                           :parameters => {'timeMin' => event.start_time.rfc3339, 'timeMax' => event.stop_time.rfc3339,
-                            'q' => event.title, 'singleEvents' => "true", 'calendarId' => calendar_id})
+                            'q' => event.query_title, 'singleEvents' => "true", 'calendarId' => calendar_id})
 
   if !result.data?
     false
@@ -257,7 +275,9 @@ def scrape_all calendar_id
 
   # TODO: Parse the nav at the bottom and crawl all pages
   SCRAPE_LIMIT.times do |i|
-    uri = URI.parse(BASE_URL + i.to_s)
+    uri = URI.parse(BASE_URL + (i+1).to_s)
+
+    puts "Fetching #{BASE_URL}#{i+1}"
 
     parse_page( Net::HTTP.get_response(uri).body, calendar_id )
   end
