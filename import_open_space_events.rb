@@ -80,8 +80,7 @@ class Event
 
   def query_title
     # Remove special characters
-    title.gsub!("-"," ")
-    title.gsub!(":"," ")
+    title.gsub("-"," ").gsub(":"," ")
   end
 
   def to_hash
@@ -122,7 +121,7 @@ class Event
 end
 
 class Time
-  def rfc3339 i = nil
+  def rfc3339 i = 0
     to_datetime.rfc3339(i)
   end
 end
